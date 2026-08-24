@@ -4,6 +4,7 @@
 # DeepSpeed Team
 import torch
 
+import warnings
 from typing import Any, Tuple
 from torch import Tensor
 from torch.nn import Module
@@ -12,7 +13,7 @@ from einops import rearrange
 
 import deepspeed.comm as dist
 from deepspeed.accelerator import get_accelerator
-from deepspeed.module_inject.tp_shard import get_shard_size_list, set_num_kv_heads, get_num_kv_heads
+from deepspeed.module_inject.tp_shard import get_shard_size_list
 from deepspeed.utils import groups
 
 try:
@@ -128,13 +129,108 @@ def apply_rotary_pos_emb(t, freqs_cos, freqs_sin):
     return res
 
 
-def uneven_heads_all2all(input, scatter_idx, gather_idx, batch_dim_idx, group):
+_UNSET = object()
+
+# Deprecated process-wide shim. DistributedAttention never reads or writes this.
+# Raw ``_SeqAllToAll.apply`` without an explicit total_heads still uses it so
+# existing tests (TestUlyssesAll2All_odd) keep working.
+_ulysses_num_kv_heads = None
+
+_HEAD_COUNT_ATTRS = (
+    "num_key_value_heads",
+    "num_kv_heads",
+    "num_attention_heads",
+    "num_heads",
+    "n_heads",
+    "n_head",
+)
+
+
+def set_ulysses_num_kv_heads(num):
+    """Deprecated process-wide setter kept for Megatron-DeepSpeed and similar callers."""
+    warnings.warn(
+        "set_ulysses_num_kv_heads() is deprecated and process-wide; it will be removed in a future "
+        "release. Pass num_kv_heads to DistributedAttention instead so each instance keeps its own "
+        "head count.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    global _ulysses_num_kv_heads
+    _ulysses_num_kv_heads = num
+
+
+def get_ulysses_num_kv_heads():
+    return _ulysses_num_kv_heads
+
+
+def _probe_local_attn_num_heads(local_attn):
+    """Read a head count off ``local_attn`` or ``local_attn.config`` if present."""
+    if local_attn is None:
+        return None
+    for name in _HEAD_COUNT_ATTRS:
+        value = getattr(local_attn, name, None)
+        if value is not None:
+            return value
+    config = getattr(local_attn, "config", None)
+    if config is not None:
+        for name in _HEAD_COUNT_ATTRS:
+            value = getattr(config, name, None)
+            if value is not None:
+                return value
+    return None
+
+
+def _capture_total_heads_from_scatter(tensor, scatter_idx, seq_world_size):
+    """Recover the total head count from a scatter-direction tensor, or None.
+
+    Only the scatter direction (``scatter_idx >= 2``) exposes the unsharded head
+    count on ``tensor.shape[2]``. The gather direction and even splits cannot.
+    """
+    if scatter_idx < 2:
+        return None
+    num_heads = tensor.shape[2]
+    if num_heads % seq_world_size != 0:
+        assert num_heads > seq_world_size, (
+            f"Number of heads ({num_heads}) must be larger than sequence parallel size ({seq_world_size})")
+        return num_heads
+    return None
+
+
+def _resolve_total_heads(input, scatter_idx, group, total_heads, allow_global_fallback):
+    """Resolve the total head count for this all-to-all.
+
+    ``total_heads is _UNSET`` means the caller omitted the argument (raw
+    ``_SeqAllToAll.apply``). ``total_heads is None`` is an explicit unknown from
+    DistributedAttention and must not consult the process-wide shim.
+    """
+    if total_heads is not _UNSET and total_heads is not None:
+        return total_heads
+
+    seq_world_size = dist.get_world_size(group)
+    captured = _capture_total_heads_from_scatter(input, scatter_idx, seq_world_size)
+    if captured is not None:
+        if allow_global_fallback:
+            global _ulysses_num_kv_heads
+            if _ulysses_num_kv_heads is None:
+                _ulysses_num_kv_heads = captured
+        return captured
+
+    if total_heads is not _UNSET:
+        return None
+
+    if allow_global_fallback:
+        return get_ulysses_num_kv_heads()
+
+    return None
+
+
+def uneven_heads_all2all(input, scatter_idx, gather_idx, batch_dim_idx, group, total_heads):
     seq_world_size = dist.get_world_size(group)
     inp_shape = list(input.shape)
     assert batch_dim_idx in [0, 1], "batch_dim_idx must be either 0 or 1"
 
     if not (scatter_idx < 2):
-        input_splits = get_shard_size_list(inp_shape[scatter_idx], seq_world_size)
+        input_splits = get_shard_size_list(inp_shape[scatter_idx], seq_world_size, num_kv_heads=total_heads)
         input = input.transpose(0, scatter_idx).contiguous()
         local_heads = input_splits[groups._get_sequence_parallel_rank()]
         output_splits = [local_heads] * seq_world_size
@@ -168,7 +264,7 @@ def uneven_heads_all2all(input, scatter_idx, gather_idx, batch_dim_idx, group):
         elif batch_dim_idx == 1:  #s,b,h
             input = input.transpose(1, 2).contiguous()  #s,h,b
         seq_len, h, batch_size = input.shape
-        num_local_heads_list = get_shard_size_list(get_num_kv_heads(), seq_world_size)
+        num_local_heads_list = get_shard_size_list(total_heads, seq_world_size, num_kv_heads=total_heads)
         local_heads = num_local_heads_list[groups._get_sequence_parallel_rank()]
         h_dim = h // local_heads
         local_seq_len = seq_len // seq_world_size
@@ -179,7 +275,7 @@ def uneven_heads_all2all(input, scatter_idx, gather_idx, batch_dim_idx, group):
         coeff = local_seq_len_with_heads // local_heads  #per head: dim size of local_seq_len*hdim
 
         #uneven seq_world_size coeff,  total_heads/local_heads.
-        heads_scale_coeff = get_num_kv_heads() / local_heads
+        heads_scale_coeff = total_heads / local_heads
 
         output_splits = [num_local_heads * coeff for num_local_heads in num_local_heads_list]
         output_buff_d1_size = int(heads_scale_coeff * local_seq_len_with_heads)
@@ -196,9 +292,9 @@ def uneven_heads_all2all(input, scatter_idx, gather_idx, batch_dim_idx, group):
         #total_num_large_heads=sum([2,2,2])=7
         #total_num_small_heads=sum([1])=1
 
-        chunk_num_heads_small = get_num_kv_heads() // seq_world_size  # even heads compatible
+        chunk_num_heads_small = total_heads // seq_world_size  # even heads compatible
         chunk_num_heads_large = chunk_num_heads_small + 1
-        num_chunk_heads_large = get_num_kv_heads() % seq_world_size
+        num_chunk_heads_large = total_heads % seq_world_size
         num_chunk_heads_small = seq_world_size - num_chunk_heads_large
         total_num_large_heads = num_chunk_heads_large * chunk_num_heads_large
         total_num_small_heads = num_chunk_heads_small * chunk_num_heads_small
@@ -238,21 +334,24 @@ def uneven_heads_all2all(input, scatter_idx, gather_idx, batch_dim_idx, group):
     return output
 
 
-def single_all_to_all(input, scatter_idx, gather_idx, batch_dim_idx, group, async_op=False, handle=None, type=None):
+def single_all_to_all(input,
+                      scatter_idx,
+                      gather_idx,
+                      batch_dim_idx,
+                      group,
+                      async_op=False,
+                      handle=None,
+                      type=None,
+                      total_heads=None):
     seq_world_size = dist.get_world_size(group)
     # we only need num_heads once
     num_heads = input.shape[2]
 
-    if get_num_kv_heads() is not None or (num_heads % seq_world_size != 0 and not scatter_idx < 2):
+    if total_heads is not None:
         # Assuming here that the number of heads for q is consistent with kv
         # If not, additional logic is required for cases like GQA
-        if get_num_kv_heads() is None:
-            assert num_heads > seq_world_size, f"Number of heads ({num_heads}) must be larger than sequence parallel size ({seq_world_size})"
-            # set heads at first call by num_total_heads.
-            # then use ``get_num_kv_heads() is not None`` to re-entry uneven path.
-            set_num_kv_heads(num_heads)
         assert async_op == False, "uneven head sp does not support async op"
-        return uneven_heads_all2all(input, scatter_idx, gather_idx, batch_dim_idx, group)
+        return uneven_heads_all2all(input, scatter_idx, gather_idx, batch_dim_idx, group, total_heads)
 
     pre_all2all_permute_idx, pre_all2all_inp_shape, post_all2all_permute_idx, post_all2all_res_shape = _generate_layout_params(
         scatter_idx, batch_dim_idx, seq_world_size, input)
@@ -306,7 +405,10 @@ class _SeqAllToAll(torch.autograd.Function):
                 stream=None,
                 handle=None,
                 type=None,
-                is_fwd=True) -> Tensor:
+                is_fwd=True,
+                total_heads=_UNSET) -> Tensor:
+        allow_global_fallback = total_heads is _UNSET
+        resolved = _resolve_total_heads(input, scatter_idx, group, total_heads, allow_global_fallback)
         ctx.group = group
         ctx.scatter_idx = scatter_idx
         ctx.gather_idx = gather_idx
@@ -314,38 +416,56 @@ class _SeqAllToAll(torch.autograd.Function):
         ctx.handle = handle
         ctx.type = type
         ctx.batch_dim_idx = batch_dim_idx
+        ctx.total_heads = resolved
         if ctx.handle is None:
-            res = single_all_to_all(input, scatter_idx, gather_idx, batch_dim_idx, group, False)
+            res = single_all_to_all(input, scatter_idx, gather_idx, batch_dim_idx, group, False, total_heads=resolved)
 
         else:
             # overlap communication path
             if not is_fwd and type == 'o':
                 assert ctx.stream != None
-                res = single_all_to_all(input, scatter_idx, gather_idx, batch_dim_idx, group, False)
+                res = single_all_to_all(input,
+                                        scatter_idx,
+                                        gather_idx,
+                                        batch_dim_idx,
+                                        group,
+                                        False,
+                                        total_heads=resolved)
                 get_accelerator().current_stream().wait_stream(ctx.stream)
                 # The computation of d o_weight can overlap with the communication of d o_input
 
             elif not is_fwd and type in ('q', 'k'):
                 # Achieve communication overlap by pipelining the matrix computation and communication of dq, dk, and dv
                 type = 'd' + type
-                res = single_all_to_all(input, scatter_idx, gather_idx, batch_dim_idx, group, True, handle, type)
+                res = single_all_to_all(input, scatter_idx, gather_idx, batch_dim_idx, group, True, handle, type,
+                                        resolved)
 
             elif is_fwd and type in ('q', 'k'):
                 # Achieve communication overlap by pipelining the matrix computation and communication of q, k, and v
                 type = 'fwd_' + type
-                res = single_all_to_all(input, scatter_idx, gather_idx, batch_dim_idx, group, False, handle, type)
+                res = single_all_to_all(input, scatter_idx, gather_idx, batch_dim_idx, group, False, handle, type,
+                                        resolved)
 
             else:
-                res = single_all_to_all(input, scatter_idx, gather_idx, batch_dim_idx, group, False)
+                res = single_all_to_all(input,
+                                        scatter_idx,
+                                        gather_idx,
+                                        batch_dim_idx,
+                                        group,
+                                        False,
+                                        total_heads=resolved)
 
         return res
 
     @staticmethod
-    def backward(ctx: Any, *grad_output: Tensor) -> Tuple[None, Tensor, None, None]:
+    def backward(
+            ctx: Any,
+            *grad_output: Tensor) -> Tuple[None, Tensor, None, None, None, None, None, None, None, None]:
 
         return (None,
                 _SeqAllToAll.apply(ctx.group, *grad_output, ctx.gather_idx, ctx.scatter_idx, ctx.batch_dim_idx,
-                                   ctx.stream, ctx.handle, ctx.type, False), None, None, None, None, None, None, None)
+                                   ctx.stream, ctx.handle, ctx.type, False, ctx.total_heads), None, None, None, None,
+                None, None, None, None)
 
 
 class DistributedAttention(torch.nn.Module):
@@ -356,6 +476,9 @@ class DistributedAttention(torch.nn.Module):
         sequence_process_group (ProcessGroup): sequence parallel process group
         scatter_idx (int): scatter_idx for all2all comm
         gather_idx (int): gather_idx for all2all comm
+        num_kv_heads (int, optional): total head count for this instance. Preferred
+            over probing ``local_attention``. DistributedAttention never reads or
+            writes the process-wide Ulysses shim.
     """
 
     def __init__(
@@ -365,6 +488,7 @@ class DistributedAttention(torch.nn.Module):
         scatter_idx: int = 2,
         gather_idx: int = 0,
         sp_stream=None,
+        num_kv_heads=None,
     ) -> None:
 
         super(DistributedAttention, self).__init__()
@@ -375,10 +499,23 @@ class DistributedAttention(torch.nn.Module):
         self.sp_overlap_comm = False
         self.overlap_handles = None
         self.sp_stream = sp_stream
+        if num_kv_heads is not None:
+            self.total_heads = num_kv_heads
+        else:
+            self.total_heads = _probe_local_attn_num_heads(local_attention)
         if sp_stream is not None:
             self.overlap_handles = {}
             self.sp_overlap_comm = True
             self.default_stream = get_accelerator().default_stream()
+
+    def _bind_total_heads(self, tensor):
+        """Lazy-capture the total head count onto this instance on first uneven scatter."""
+        if self.total_heads is not None:
+            return
+        seq_world_size = dist.get_world_size(self.spg)
+        captured = _capture_total_heads_from_scatter(tensor, self.scatter_idx, seq_world_size)
+        if captured is not None:
+            self.total_heads = captured
 
     def layer_sync(self, layer):
         if self.sp_overlap_comm and hasattr(layer, 'done_event'):
@@ -422,17 +559,19 @@ class DistributedAttention(torch.nn.Module):
 
             return pre_hook_fun
 
+        self._bind_total_heads(query)
+
         self.layer_sync(query)
         query_layer = _SeqAllToAll.apply(self.spg, query, self.scatter_idx, self.gather_idx, batch_dim_idx, None,
-                                         self.overlap_handles, 'q')
+                                         self.overlap_handles, 'q', True, self.total_heads)
         self.layer_sync(key)
         key_layer = _SeqAllToAll.apply(self.spg, key, self.scatter_idx, self.gather_idx, batch_dim_idx, None,
-                                       self.overlap_handles, 'k')
+                                       self.overlap_handles, 'k', True, self.total_heads)
         if self.sp_overlap_comm:
             self.default_stream.wait_stream(self.sp_stream)
 
         value_layer = _SeqAllToAll.apply(self.spg, value, self.scatter_idx, self.gather_idx, batch_dim_idx, None,
-                                         self.overlap_handles, 'v')
+                                         self.overlap_handles, 'v', True, self.total_heads)
 
         if self.sp_overlap_comm:
             # Register a hook to synchronize dq and dk after the all-to-all
@@ -454,7 +593,7 @@ class DistributedAttention(torch.nn.Module):
         context_layer = self.local_attn(query_layer, key_layer, value_layer, *args, **kwargs)
 
         output = _SeqAllToAll.apply(self.spg, context_layer, self.gather_idx, self.scatter_idx, batch_dim_idx,
-                                    self.sp_stream, self.overlap_handles, 'o')
+                                    self.sp_stream, self.overlap_handles, 'o', True, self.total_heads)
 
         #out e.g., [s/p::h]
         return output
